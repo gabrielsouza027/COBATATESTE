@@ -6,6 +6,7 @@ import locale
 import plotly.express as px
 from cachetools import TTLCache
 import os
+import math
 
 # Tentar definir o locale para formatação monetária
 try:
@@ -14,12 +15,16 @@ except locale.Error:
     st.warning("Locale 'pt_BR.UTF-8' não disponível. Usando formatação padrão.")
     locale.setlocale(locale.LC_ALL, '')
 
-# Configuração do cache (TTL de 180 segundos)
-cache = TTLCache(maxsize=1, ttl=180)
+# Configuração do cache (TTL de 300 segundos para permitir atualizações frequentes)
+cache = TTLCache(maxsize=1, ttl=300)
 
-# Configuração do cliente Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zozomnppwpwgtqdgtwny.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpvem9tbnBwd3B3Z3RxZGd0d255Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDY1NTYzMDYsImV4cCI6MjA2MjEzMjMwNn0.KcX5BOG-hiqo6baMinRuJjxmtgGKbWNZjNuzVLk9GiI")
+# Configuração do cliente Supabase usando st.secrets para Streamlit Cloud
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except KeyError:
+    st.error("Erro: SUPABASE_URL ou SUPABASE_KEY não estão definidos nos segredos do Streamlit.")
+    st.stop()
 
 # Validar URL e chave
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -33,7 +38,7 @@ except Exception as e:
     st.error(f"Erro ao inicializar o cliente Supabase: {e}")
     st.stop()
 
-# Função para obter dados do Supabase com cache
+# Função para obter dados do Supabase com paginação
 @st.cache_data(show_spinner=False)
 def carregar_dados():
     cache_key = "PCPEDC_data"
@@ -41,29 +46,45 @@ def carregar_dados():
         return cache[cache_key]
 
     try:
-        # Buscar todos os dados da tabela PCPEDC sem limite
-        response = supabase.table("PCPEDC").select("*").execute()
-        data = response.data
+        # Configurações de paginação
+        page_size = 1000  # Tamanho da página (máximo permitido pelo Supabase)
+        offset = 0
+        all_data = []
 
-        if data:
-            df = pd.DataFrame(data)
+        while True:
+            # Buscar dados com paginação
+            response = supabase.table("PCPEDC").select("*").range(offset, offset + page_size - 1).execute()
+            data = response.data
+
+            if not data:
+                break
+
+            all_data.extend(data)
+            offset += page_size
+
+            # Se a quantidade de dados retornados for menor que o page_size, é a última página
+            if len(data) < page_size:
+                break
+
+        if all_data:
+            df = pd.DataFrame(all_data)
             required_columns = ['PVENDA', 'QT', 'CODFILIAL', 'DATA_PEDIDO', 'NUMPED']
             missing_columns = [col for col in required_columns if col not in df.columns]
             if missing_columns:
                 st.error(f"Colunas ausentes nos dados retornados pela API: {missing_columns}")
                 cache[cache_key] = pd.DataFrame()
                 return pd.DataFrame()
-            
+
             # Converter DATA_PEDIDO para datetime
             df['DATA_PEDIDO'] = pd.to_datetime(df['DATA_PEDIDO'], errors='coerce')
             df = df.dropna(subset=['DATA_PEDIDO'])  # Remover linhas com DATA_PEDIDO inválida
-            
+
             # Calcular VLTOTAL como PVENDA * QT
             df['PVENDA'] = pd.to_numeric(df['PVENDA'], errors='coerce').fillna(0)
             df['QT'] = pd.to_numeric(df['QT'], errors='coerce').fillna(0)
             df['VLTOTAL'] = df['PVENDA'] * df['QT']
             df['VLTOTAL'] = df['VLTOTAL'].fillna(0)
-            
+
             # Filtrar apenas filiais 1 e 2
             df = df[df['CODFILIAL'].isin(['1', '2'])]
             cache[cache_key] = df
@@ -82,24 +103,32 @@ def carregar_dados():
 def calcular_faturamento(data, hoje, ontem, semana_inicial, semana_passada_inicial):
     faturamento_hoje = data[data['DATA_PEDIDO'].dt.date == hoje.date()]['VLTOTAL'].sum()
     faturamento_ontem = data[data['DATA_PEDIDO'].dt.date == ontem.date()]['VLTOTAL'].sum()
-    faturamento_semanal_atual = data[(data['DATA_PEDIDO'].dt.date >= semana_inicial.date()) & (data['DATA_PEDIDO'].dt.date <= hoje.date())]['VLTOTAL'].sum()
-    faturamento_semanal_passada = data[(data['DATA_PEDIDO'].dt.date >= semana_passada_inicial.date()) & (data['DATA_PEDIDO'].dt.date < semana_inicial.date())]['VLTOTAL'].sum()
+    faturamento_semanal_atual = data[(data['DATA_PEDIDO'].dt.date >= semana_inicial.date()) & 
+                                     (data['DATA_PEDIDO'].dt.date <= hoje.date())]['VLTOTAL'].sum()
+    faturamento_semanal_passada = data[(data['DATA_PEDIDO'].dt.date >= semana_passada_inicial.date()) & 
+                                      (data['DATA_PEDIDO'].dt.date < semana_inicial.date())]['VLTOTAL'].sum()
     return faturamento_hoje, faturamento_ontem, faturamento_semanal_atual, faturamento_semanal_passada
 
 def calcular_quantidade_pedidos(data, hoje, ontem, semana_inicial, semana_passada_inicial):
     pedidos_hoje = data[data['DATA_PEDIDO'].dt.date == hoje.date()]['NUMPED'].nunique()
     pedidos_ontem = data[data['DATA_PEDIDO'].dt.date == ontem.date()]['NUMPED'].nunique()
-    pedidos_semanal_atual = data[(data['DATA_PEDIDO'].dt.date >= semana_inicial.date()) & (data['DATA_PEDIDO'].dt.date <= hoje.date())]['NUMPED'].nunique()
-    pedidos_semanal_passada = data[(data['DATA_PEDIDO'].dt.date >= semana_passada_inicial.date()) & (data['DATA_PEDIDO'].dt.date < semana_inicial.date())]['NUMPED'].nunique()
+    pedidos_semanal_atual = data[(data['DATA_PEDIDO'].dt.date >= semana_inicial.date()) & 
+                                (data['DATA_PEDIDO'].dt.date <= hoje.date())]['NUMPED'].nunique()
+    pedidos_semanal_passada = data[(data['DATA_PEDIDO'].dt.date >= semana_passada_inicial.date()) & 
+                                  (data['DATA_PEDIDO'].dt.date < semana_inicial.date())]['NUMPED'].nunique()
     return pedidos_hoje, pedidos_ontem, pedidos_semanal_atual, pedidos_semanal_passada
 
 def calcular_comparativos(data, hoje, mes_atual, ano_atual):
     mes_anterior = mes_atual - 1 if mes_atual > 1 else 12
     ano_anterior = ano_atual if mes_atual > 1 else ano_atual - 1
-    faturamento_mes_atual = data[(data['DATA_PEDIDO'].dt.month == mes_atual) & (data['DATA_PEDIDO'].dt.year == ano_atual)]['VLTOTAL'].sum()
-    pedidos_mes_atual = data[(data['DATA_PEDIDO'].dt.month == mes_atual) & (data['DATA_PEDIDO'].dt.year == ano_atual)]['NUMPED'].nunique()
-    faturamento_mes_anterior = data[(data['DATA_PEDIDO'].dt.month == mes_anterior) & (data['DATA_PEDIDO'].dt.year == ano_anterior)]['VLTOTAL'].sum()
-    pedidos_mes_anterior = data[(data['DATA_PEDIDO'].dt.month == mes_anterior) & (data['DATA_PEDIDO'].dt.year == ano_anterior)]['NUMPED'].nunique()
+    faturamento_mes_atual = data[(data['DATA_PEDIDO'].dt.month == mes_atual) & 
+                                 (data['DATA_PEDIDO'].dt.year == ano_atual)]['VLTOTAL'].sum()
+    pedidos_mes_atual = data[(data['DATA_PEDIDO'].dt.month == mes_atual) & 
+                             (data['DATA_PEDIDO'].dt.year == ano_atual)]['NUMPED'].nunique()
+    faturamento_mes_anterior = data[(data['DATA_PEDIDO'].dt.month == mes_anterior) & 
+                                   (data['DATA_PEDIDO'].dt.year == ano_anterior)]['VLTOTAL'].sum()
+    pedidos_mes_anterior = data[(data['DATA_PEDIDO'].dt.month == mes_anterior) & 
+                               (data['DATA_PEDIDO'].dt.year == ano_anterior)]['NUMPED'].nunique()
     return faturamento_mes_atual, faturamento_mes_anterior, pedidos_mes_atual, pedidos_mes_anterior
 
 def formatar_valor(valor):
@@ -189,7 +218,7 @@ def main():
         ano_atual = hoje.year
         faturamento_mes_atual, faturamento_mes_anterior, pedidos_mes_atual, pedidos_mes_anterior = calcular_comparativos(data_filtrada, hoje, mes_atual, ano_atual)
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3 Laid, col4, col5 = st.columns(5)
 
         def calcular_variacao(atual, anterior):
             if anterior == 0:
@@ -276,7 +305,7 @@ def main():
                 <div class="card-container">
                     <img src="https://cdn-icons-png.flaticon.com/512/6632/6632848.png" alt="Ícone Pedidos Mês Atual">
                     <span>Pedidos Mês Atual:</span> 
-                    <div class="number">{pedidos_mes_atual}</div>
+                    <div class="number">{ percepdidos_mes_atual}</div>
                     <small>Variação: {icone_variacao(var_pedidos_mes)}</small>
                 </div>
                 <div class="card-container">
@@ -307,7 +336,7 @@ def main():
         with col1:
             st.plotly_chart(grafico_pizza_variacao(["Hoje", "Ontem"], [faturamento_hoje, faturamento_ontem], "Variação de Faturamento (Hoje x Ontem)"), use_container_width=True)
         with col2:
-            st.plotly_chart(grafico_pizza_variacao(["Semana Atual", "Semana.COLUMN Passada"], [faturamento_semanal_atual, faturamento_semanal_passada], "Variação de Faturamento (Semana)"), use_container_width=True)
+            st.plotly_chart(grafico_pizza_variacao(["Semana Atual", "Semana Passada"], [faturamento_semanal_atual, faturamento_semanal_passada], "Variação de Faturamento (Semana)"), use_container_width=True)
         with col3:
             st.plotly_chart(grafico_pizza_variacao(["Mês Atual", "Mês Anterior"], [faturamento_mes_atual, faturamento_mes_anterior], "Variação de Faturamento (Mês)"), use_container_width=True)
         with col4:
@@ -324,7 +353,7 @@ def main():
         min_date = data_filtrada['DATA_PEDIDO'].min() if not data_filtrada.empty else pd.to_datetime("2024-01-01")
         max_date = data_filtrada['DATA_PEDIDO'].max() if not data_filtrada.empty else pd.to_datetime("today")
         with col_data1:
-            data_inicial = st.date_input("Data Inicial", value=pd.to_datetime("2024-04-08"), min_value=min_date, max_value=max_date)
+            data_inicial = st.date_input("Data Inicial", value=min_date, min_value=min_date, max_value=max_date)
         with col_data2:
             data_final = st.date_input("Data Final", value=max_date, min_value=min_date, max_value=max_date)
 
